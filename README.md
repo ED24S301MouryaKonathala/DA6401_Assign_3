@@ -2,6 +2,10 @@
 
 This project implements a sequence-to-sequence model with attention mechanism for transliterating English text to Telugu script using PyTorch.
 
+# Wandb Report
+[Wandb Report](https://wandb.ai/mourya001-indian-institute-of-technology-madras/telugu-transliteration/reports/Assignment-3--VmlldzoxMjg2MjM0NA?accessToken=e1jbrfdk5im003e4wskcseze4jk6xu6zeravkwbf0nv5lx3s42e5qn66p7x9jumd)
+
+
 ## System Requirements
 - Python 3.6+
 - CUDA-capable GPU (recommended)
