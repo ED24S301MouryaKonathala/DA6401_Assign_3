@@ -1,17 +1,17 @@
 class Config:
     def __init__(self):
         # Model params
-        self.embedding_dim = 256
+        self.embedding_dim = 128
         self.hidden_dim = 512
-        self.num_encoder_layers = 2
-        self.num_decoder_layers = 2
-        self.dropout = 0.3
-        self.cell_type = 'lstm'
+        self.num_encoder_layers = 3
+        self.num_decoder_layers = 5
+        self.dropout = 0.2
+        self.cell_type = 'gru'
         
         # Training params - optimized for transliteration
-        self.batch_size = 128  # Increased for better throughput
-        self.epochs = 25
-        self.learning_rate = 0.001
+        self.batch_size = 512  # Increased for better throughput
+        self.epochs = 30
+        self.learning_rate = 0.0005
         self.beam_eval_epochs = 5  # Evaluate beam search every N epochs
         
         # Inference params

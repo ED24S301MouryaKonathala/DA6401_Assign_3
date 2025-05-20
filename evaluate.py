@@ -4,149 +4,155 @@ import argparse
 from model.config import Config
 from model.seq2seq import Seq2SeqModel
 from model.data_utils import TransliterationDataset, collate_fn
-from model.beam_search import BeamSearchDecoder
 from torch.utils.data import DataLoader
 import pandas as pd
 import os
-from utils.visualize import generate_attention_visualizations
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import matplotlib.font_manager as fm
 
-def load_best_model(project_name="telugu-transliteration"):
-    api = wandb.Api()
-    runs = api.runs(f"mourya001-indian-institute-of-technology-madras/{project_name}")
-    best_run = sorted(runs, key=lambda run: run.summary.get('best_val_accuracy', 0), reverse=True)[0]
+def load_best_model(attention=False):
+    """Load model from local checkpoint file"""
+    model_path = 'best_model_with_attention.pt' if attention else 'best_model_without_attention.pt'
+    print(f"Loading model from: {model_path}")
     
-    print(f"Loading best model from run: {best_run.name}")
-    print(f"Best validation accuracy: {best_run.summary.get('best_val_accuracy', 0):.4f}")
-    
-    artifact = api.artifact(f'mourya001-indian-institute-of-technology-madras/{project_name}/model-{best_run.id}:latest')
-    artifact_dir = artifact.download()
-    
-    checkpoint = torch.load(f'{artifact_dir}/checkpoint.pt')
-    
+    checkpoint = torch.load(model_path)
     config = Config()
     for key, value in checkpoint['config'].items():
         setattr(config, key, value)
     
     model = Seq2SeqModel(config)
     model.load_state_dict(checkpoint['model_state_dict'])
-    
     return model, config, checkpoint
 
-def evaluate_greedy(model, test_loader, checkpoint, device):
-    """Evaluate using greedy decoding (exact matches only)"""
-    correct = 0
-    total = 0
-    predictions = []
-    
-    with torch.no_grad():
-        for src, tgt in test_loader:
-            src = src.to(device)
-            tgt = tgt.to(device)
-            outputs = model(src, None)
-            pred_tokens = torch.argmax(outputs, dim=-1)
-            
-            # Only count exact matches
-            correct += (pred_tokens == tgt).all(dim=1).sum().item()
-            total += src.size(0)
-            
-            # Save predictions
-            for i in range(len(src)):
-                pred_text = ''.join([checkpoint['idx2char_tgt'][idx.item()] for idx in pred_tokens[i]])
-                true_text = ''.join([checkpoint['idx2char_tgt'][idx.item()] for idx in tgt[i]])
-                src_text = ''.join([checkpoint['idx2char_src'][idx.item()] for idx in src[i]])
-                predictions.append({
-                    'source': src_text,
-                    'prediction': pred_text,
-                    'target': true_text,
-                    'correct': pred_text == true_text
-                })
-    
-    return correct / total, predictions
+def clean_special_tokens(text_indices, idx2char):
+    """Remove special tokens and return clean text"""
+    special_tokens = {'<pad>', '<sos>', '<eos>'}
+    return ''.join(idx2char[idx.item()] for idx in text_indices 
+                  if idx2char[idx.item()] not in special_tokens)
 
-def evaluate_beam_search(model, test_loader, config, checkpoint, device):
-    """Evaluate using beam search decoding"""
+def plot_attention_heatmap(attention_weights, src_tokens, tgt_tokens, output_path):
+    """Create attention heatmap visualization with clean tokens"""
+    # Remove special tokens from source and target
+    special_tokens = {'<pad>', '<sos>', '<eos>'}
+    src_tokens = [t for t in src_tokens if t not in special_tokens]
+    tgt_tokens = [t for t in tgt_tokens if t not in special_tokens]
+    
+    # Trim attention weights to match clean tokens - fixed bracket syntax
+    clean_attention = attention_weights[:len(tgt_tokens), :len(src_tokens)]
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(clean_attention, xticklabels=src_tokens, yticklabels=tgt_tokens)
+    plt.xlabel('Source Tokens')
+    plt.ylabel('Target Tokens')
+    plt.savefig(output_path)
+    plt.close()
+
+def plot_attention_heatmaps(inputs, attentions, predictions, targets, save_path):
+    """Plot attention heatmaps showing complete character alignments"""
+    fig, axes = plt.subplots(3, 3, figsize=(24, 24))
+    try:
+        telugu_font = fm.FontProperties(fname="NotoSansTelugu-Regular.ttf")
+    except:
+        print("Warning: Telugu font not found")
+        telugu_font = None
+
+    for idx, (src_text, attn_matrix, pred_text, _) in enumerate(zip(inputs, attentions, predictions, targets)):
+        if idx >= 9: break
+        i, j = divmod(idx, 3)
+        
+        # Get full character sequences
+        src_chars = list(src_text)
+        pred_chars = list(pred_text)
+        
+        # Normalize attention matrix properly
+        attn = np.array(attn_matrix)
+        attn = attn / (attn.sum(axis=1, keepdims=True) + 1e-12)
+        
+        # Create heatmap with improved settings
+        sns.heatmap(
+            attn,
+            ax=axes[i, j],
+            cmap='YlOrRd',
+            xticklabels=src_chars,
+            yticklabels=pred_chars,
+            cbar=True,
+            square=True,
+            vmin=0.0,
+            vmax=1.0,
+            annot=True,
+            fmt='.2f',
+            cbar_kws={'label': 'Attention Weight'}
+        )
+        
+        # Configure labels
+        axes[i,j].set_xticklabels(src_chars, rotation=45, ha='right', fontsize=10)
+        if telugu_font:
+            axes[i,j].set_yticklabels(pred_chars, fontproperties=telugu_font, fontsize=10)
+        
+        axes[i,j].set_xlabel('English', fontsize=12)
+        axes[i,j].set_ylabel('Telugu', fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+def evaluate_model(model, test_loader, checkpoint, device, attention=False):
+    """Evaluate model and collect attention matrices"""
     correct = 0
     total = 0
     predictions = []
+    attention_maps = []
     
-    beam_decoder = BeamSearchDecoder(model, config.beam_size, config.max_length)
-    
+    model.eval()
     with torch.no_grad():
         for src, tgt in test_loader:
             src = src.to(device)
             tgt = tgt.to(device)
             
-            # Beam search decoding
-            pred_tokens = beam_decoder.decode(src)
+            if attention:
+                outputs, attention_weights = model(src, tgt)
+                # Store raw attention weights without any filtering
+                attention_maps.extend([
+                    weights.cpu().numpy() for weights in attention_weights
+                ])
             
-            correct += (pred_tokens == tgt).all(dim=1).sum().item()
-            total += src.size(0)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            pred_tokens = torch.argmax(logits, dim=-1)
             
-            # Save predictions
             for i in range(len(src)):
-                pred_text = ''.join([checkpoint['idx2char_tgt'][idx.item()] for idx in pred_tokens[i]])
-                true_text = ''.join([checkpoint['idx2char_tgt'][idx.item()] for idx in tgt[i]])
-                src_text = ''.join([checkpoint['idx2char_src'][idx.item()] for idx in src[i]])
+                pred_clean = clean_special_tokens(pred_tokens[i], checkpoint['idx2char_tgt'])
+                target_clean = clean_special_tokens(tgt[i], checkpoint['idx2char_tgt'])
+                src_clean = clean_special_tokens(src[i], checkpoint['idx2char_src'])
+                
+                correct += (pred_clean == target_clean)
+                total += 1
                 
                 predictions.append({
-                    'source': src_text,
-                    'prediction': pred_text,
-                    'target': true_text,
-                    'correct': pred_text == true_text
+                    'source': src_clean,
+                    'prediction': pred_clean,
+                    'target': target_clean,
+                    'correct': pred_clean == target_clean
                 })
     
-    return correct / total, predictions
-
-def evaluate_test_set(model, config, test_loader, test_dataset, device, checkpoint):
-    """Evaluate model and generate visualizations"""
-    # Create prediction directories
-    os.makedirs('predictions_vanilla', exist_ok=True)
-    os.makedirs('predictions_beam', exist_ok=True)
-    if config.attention:
-        os.makedirs('predictions_attention', exist_ok=True)
-        os.makedirs('attention_plots', exist_ok=True)
-    
-    # Evaluate with both methods
-    greedy_accuracy, greedy_predictions = evaluate_greedy(model, test_loader, checkpoint, device)
-    beam_accuracy, beam_predictions = evaluate_beam_search(model, test_loader, config, checkpoint, device)
-    
-    # Save predictions
-    pred_folder = 'predictions_attention' if config.attention else 'predictions_vanilla'
-    pd.DataFrame(greedy_predictions).to_csv(f'{pred_folder}/test_predictions.csv', index=False)
-    pd.DataFrame(beam_predictions).to_csv('predictions_beam/test_predictions.csv', index=False)
-    
-    # Generate visualizations
-    samples = [(p['source'], p['target'], p['prediction']) 
-              for p in greedy_predictions[:9]]
-    create_sample_grid(samples, f'{pred_folder}/sample_grid.png')
-    
-    # Generate attention visualizations
-    if config.attention:
-        generate_attention_visualizations(
-            model,
-            test_loader,
-            test_dataset.idx2char_src,
-            test_dataset.idx2char_tgt,
-            device,
-            'attention_plots'
-        )
-    
-    return greedy_accuracy, beam_accuracy, greedy_predictions, beam_predictions
+    return correct/total, predictions, attention_maps
 
 def evaluate_test():
     parser = argparse.ArgumentParser()
     parser.add_argument('--attention', action='store_true', help='Evaluate attention model')
     args = parser.parse_args()
     
-    # Select correct project
     project_name = "telugu-transliteration-attention" if args.attention else "telugu-transliteration"
+    output_dir = 'predictions_attention' if args.attention else 'predictions_vanilla'
+    os.makedirs(output_dir, exist_ok=True)
     
-    model, config, checkpoint = load_best_model(project_name)
+    wandb.init(project=project_name, name="test_evaluation")
+    
+    model, config, checkpoint = load_best_model(args.attention)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-    model.eval()
     
-    # Create test dataset
     test_dataset = TransliterationDataset(
         'dakshina_dataset_v1.0/te/lexicons/te.translit.sampled.test.tsv',
         checkpoint['char2idx_src'],
@@ -154,33 +160,37 @@ def evaluate_test():
     )
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
     
-    # Call evaluate_test_set with all required parameters
-    greedy_accuracy, beam_accuracy, greedy_predictions, beam_predictions = evaluate_test_set(
-        model, config, test_loader, test_dataset, device, checkpoint
-    )
+    accuracy, predictions, attention_maps = evaluate_model(model, test_loader, checkpoint, device, args.attention)
+    
+    pd.DataFrame(predictions).to_csv(f'{output_dir}/test_predictions.csv', index=False)
+    
+    if args.attention:
+        os.makedirs('attention_plots', exist_ok=True)
+        for i in range(min(9, len(attention_maps))):
+            src_text = predictions[i]['source']
+            tgt_text = predictions[i]['prediction']
+            plot_attention_heatmap(
+                attention_maps[i],
+                list(src_text),
+                list(tgt_text),
+                f'attention_plots/sample_{i}.png'
+            )
+        
+        inputs = [pred['source'] for pred in predictions[:9]]
+        targets = [pred['target'] for pred in predictions[:9]]
+        preds = [pred['prediction'] for pred in predictions[:9]]
+        plot_attention_heatmaps(inputs, attention_maps[:9], preds, targets, "attention_heatmaps.png")
+        wandb.log({"attention_heatmaps": wandb.Image("attention_heatmaps.png")})
     
     print(f"\nTest Set Results:")
-    print(f"Greedy Decoding Accuracy: {greedy_accuracy:.4f}")
-    print(f"Beam Search Accuracy: {beam_accuracy:.4f}")
+    print(f"Accuracy: {accuracy:.4f}")
     
-    # Save predictions in correct folder
-    predictions_folder = 'predictions_attention' if config.attention else 'predictions_vanilla'
-    os.makedirs(predictions_folder, exist_ok=True)
-    pd.DataFrame(greedy_predictions).to_csv(f'{predictions_folder}/test_predictions.csv', index=False)
-    
-    os.makedirs('predictions_beam', exist_ok=True)
-    pd.DataFrame(beam_predictions).to_csv('predictions_beam/test_predictions.csv', index=False)
-    
-    # Initialize wandb with correct project
-    wandb.init(project=project_name, name="test_evaluation")
     wandb.log({
-        "test_greedy_accuracy": greedy_accuracy,
-        "test_beam_accuracy": beam_accuracy,
-        "greedy_predictions": wandb.Table(dataframe=pd.DataFrame(greedy_predictions).sample(n=min(10, len(greedy_predictions)))),
-        "beam_predictions": wandb.Table(dataframe=pd.DataFrame(beam_predictions).sample(n=min(10, len(beam_predictions))))
+        "test_accuracy": accuracy,
+        "predictions": wandb.Table(dataframe=pd.DataFrame(predictions).sample(n=min(10, len(predictions))))
     })
     
-    return greedy_accuracy, beam_accuracy
+    return accuracy
 
 if __name__ == "__main__":
     evaluate_test()

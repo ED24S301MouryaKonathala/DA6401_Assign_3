@@ -11,11 +11,26 @@ from model.seq2seq import Seq2SeqModel
 from model.beam_search import BeamSearchDecoder
 from sweep_config import sweep_configuration
 import time
+import os
+import shutil
+from typing import Dict, Any
 
 # Constants for performance optimization
-VALIDATION_INTERVAL = 5  # Validate every N epochs
-BEAM_EVAL_INTERVAL = 5   # Run beam search every N epochs
+VALIDATION_INTERVAL = 40  # Validate every N epochs
+BEAM_EVAL_INTERVAL = 40   # Run beam search every N epochs
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Global variables for best model tracking across sweeps
+best_run_metrics: Dict[str, Any] = {'val_accuracy': 0}
+best_model_path = ''
+
+# Global tracking for best overall model across all sweeps
+best_global_metrics = {
+    'val_accuracy': 0,
+    'model_path': None,
+    'run_id': None,
+    'config': None
+}
 
 def calculate_accuracy(predictions, targets):
     """Calculate sequence-level accuracy (exact matches only)"""
@@ -58,6 +73,7 @@ def print_examples(src_texts, tgt_texts, pred_texts, n=5):
         print("-" * 80)
 
 def train():
+    global best_run_metrics, best_model_path, best_global_metrics
     # Initialize wandb with sweep
     run = wandb.init()
     
@@ -97,7 +113,8 @@ def train():
     wandb.watch(model, log="all")
     
     best_val_accuracy = 0
-    best_model_path = 'best_model.pt'  # Path for best model
+    # best_model_local = 'best_model_local.pt'  # Local best model
+    # best_model_wandb = 'best_model_wandb.pt'  # WandB best model
     
     # Training loop with progress bars
     for epoch in range(config.epochs):
@@ -210,7 +227,7 @@ def train():
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
             checkpoint = {
-                **metrics,
+                'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': config.__dict__,
@@ -218,33 +235,57 @@ def train():
                 'char2idx_tgt': train_dataset.char2idx_tgt,
                 'idx2char_src': train_dataset.idx2char_src,
                 'idx2char_tgt': train_dataset.idx2char_tgt,
+                'val_accuracy': val_accuracy,
+                'beam_accuracy': beam_accuracy,
+                'metrics': metrics
             }
             
             # Save locally
-            torch.save(checkpoint, best_model_path)
-            print(f"\nSaved best model with validation accuracy {val_accuracy:.4f} to {best_model_path}")
+            torch.save(checkpoint, best_model_local)
+            print(f"\nSaved best model with validation accuracy {val_accuracy:.4f} to {best_model_local}")
             
             # Save to wandb
-            new_artifact = wandb.Artifact(
-                name=f"model-{wandb.run.id}-epoch-{epoch}",
+            torch.save(checkpoint, best_model_wandb)
+            artifact = wandb.Artifact(
+                name=f"model-{wandb.run.id}",
                 type="model",
-                description=f"Model checkpoint from epoch {epoch}",
+                description=f"Best model from run with val_acc={val_accuracy:.4f}",
                 metadata=dict(wandb.config)
             )
-            new_artifact.add_file(best_model_path)
-            wandb.log_artifact(new_artifact)
+            artifact.add_file(best_model_wandb)
+            wandb.log_artifact(artifact, aliases=['best'])
             
             # Update summary metrics
             wandb.run.summary.update({
                 'best_val_accuracy': val_accuracy,
-                'best_model_path': best_model_path,
-                'best_beam_accuracy': beam_accuracy,  # Still track beam accuracy
-                'best_epoch': epoch,
-                'source_vocab_size': config.source_vocab_size,
-                'target_vocab_size': config.target_vocab_size,
-                'total_parameters': sum(p.numel() for p in model.parameters()),
-                'convergence_epoch': epoch
+                'best_model_path': best_model_local,
+                'best_beam_accuracy': beam_accuracy,
+                'best_epoch': epoch
             })
+            
+            # Update global best if better
+            if val_accuracy > best_global_metrics['val_accuracy']:
+                best_global_metrics['val_accuracy'] = val_accuracy
+                best_global_metrics['model_path'] = best_model_local
+                best_global_metrics['run_id'] = wandb.run.id
+                best_global_metrics['config'] = config.__dict__.copy()
+    
+    # Track best model across sweeps
+    if val_accuracy > best_run_metrics['val_accuracy']:
+        best_run_metrics = {
+            'val_accuracy': val_accuracy,
+            'run_id': wandb.run.id,
+            'epoch': epoch,
+            'config': config.__dict__
+        }
+        # Copy the best model from this run
+        best_model_path = best_model_local
+    
+    # End of training - upload final model
+    print(f"\nTraining completed. Best validation accuracy: {best_val_accuracy:.4f}")
+    print(f"Best model saved at: {best_model_local}")
+
+    return best_val_accuracy
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -259,4 +300,15 @@ if __name__ == "__main__":
     sweep_id = wandb.sweep(sweep_configuration, project=project_name)
     
     # Run sweep
-    wandb.agent(sweep_id, train, count=100)
+    wandb.agent(sweep_id, train, count=30)
+    
+    # After all sweeps complete, save the best overall model
+    final_model_name = 'best_model_with_attention.pt' if args.attention else 'best_model_without_attention.pt'
+    if best_global_metrics['model_path'] is not None:
+        shutil.copy2(best_global_metrics['model_path'], final_model_name)
+        print(f"\nSaved best overall model as {final_model_name}")
+        print(f"Best validation accuracy: {best_global_metrics['val_accuracy']:.4f}")
+        print(f"From run: {best_global_metrics['run_id']}")
+        print("Best configuration:")
+        for k, v in best_global_metrics['config'].items():
+            print(f"  {k}: {v}")

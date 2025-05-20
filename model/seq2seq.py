@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Encoder(nn.Module):
     def __init__(self, config):
@@ -56,65 +57,103 @@ class Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attention = config.attention
+        self.hidden_dim = config.hidden_dim
+        
+        # Embedding layer
         self.embedding = nn.Embedding(config.target_vocab_size, config.embedding_dim)
-        
-        # Add dropouts at each stage
         self.embedding_dropout = nn.Dropout(config.dropout)
-        self.input_dropout = nn.Dropout(config.dropout)
-        self.output_dropout = nn.Dropout(config.dropout)
         
-        if config.cell_type == 'lstm':
-            self.rnn = nn.LSTM(
-                config.embedding_dim,
-                config.hidden_dim,
-                config.num_decoder_layers,
-                dropout=config.dropout if config.num_decoder_layers > 1 else 0,
-                batch_first=True
-            )
-        elif config.cell_type == 'gru':
-            self.rnn = nn.GRU(
-                config.embedding_dim,
-                config.hidden_dim, 
-                config.num_decoder_layers,
-                dropout=config.dropout if config.num_decoder_layers > 1 else 0,
-                batch_first=True
-            )
-        else:
-            self.rnn = nn.RNN(
-                config.embedding_dim,
-                config.hidden_dim,
-                config.num_decoder_layers,
-                dropout=config.dropout if config.num_decoder_layers > 1 else 0,
-                batch_first=True
-            )
-            
+        # Attention layers
         if self.attention:
-            self.attention_layer = nn.Linear(config.hidden_dim * 2, config.hidden_dim)
-            self.combine = nn.Linear(config.hidden_dim * 2, config.hidden_dim)
-            
-        self.fc_out = nn.Linear(config.hidden_dim, config.target_vocab_size)
-            
-    def forward(self, trg, encoder_outputs, hidden):
-        embedded = self.embedding(trg)
-        embedded = self.embedding_dropout(embedded)
-        embedded = self.input_dropout(embedded)
+            self.attention_hidden = nn.Linear(config.hidden_dim, config.hidden_dim)
+            self.attention_encoder = nn.Linear(config.hidden_dim, config.hidden_dim)
+            self.attention_combine = nn.Linear(config.hidden_dim + config.embedding_dim, 
+                                            config.embedding_dim)
         
-        if self.attention and encoder_outputs is not None:
-            # Calculate attention weights
-            attn_weights = torch.bmm(encoder_outputs, hidden[-1].unsqueeze(2))
-            attn_weights = torch.softmax(attn_weights, dim=1)
-            context = torch.bmm(encoder_outputs.transpose(1,2), attn_weights)
-            rnn_input = torch.cat((embedded, context.squeeze(2)), dim=2)
-            output, hidden = self.rnn(rnn_input, hidden)
-            output = self.combine(torch.cat((output, context.transpose(1,2)), dim=2))
-            output = self.output_dropout(output)
-            prediction = self.fc_out(output)
-            return prediction, attn_weights
+        # RNN layer
+        rnn_input_size = config.embedding_dim
+        if config.cell_type == 'lstm':
+            self.rnn = nn.LSTM(rnn_input_size, config.hidden_dim,
+                             config.num_decoder_layers,
+                             batch_first=True,
+                             dropout=config.dropout if config.num_decoder_layers > 1 else 0)
+        elif config.cell_type == 'gru':
+            self.rnn = nn.GRU(rnn_input_size, config.hidden_dim,
+                             config.num_decoder_layers,
+                             batch_first=True,
+                             dropout=config.dropout if config.num_decoder_layers > 1 else 0)
         else:
-            output, hidden = self.rnn(embedded, hidden)
-            output = self.output_dropout(output)
-            prediction = self.fc_out(output)
-            return prediction, None
+            self.rnn = nn.RNN(rnn_input_size, config.hidden_dim,
+                             config.num_decoder_layers,
+                             batch_first=True,
+                             dropout=config.dropout if config.num_decoder_layers > 1 else 0)
+        
+        self.output = nn.Linear(config.hidden_dim, config.target_vocab_size)
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def compute_attention(self, encoder_outputs, hidden):
+        """Compute comprehensive attention weights for all positions"""
+        batch_size, src_len, hidden_size = encoder_outputs.size()
+        
+        if isinstance(hidden, tuple):  # LSTM
+            query = hidden[0][-1]
+        else:  # GRU/RNN
+            query = hidden[-1]
+        
+        # Transform both query and encoder outputs
+        encoder_features = self.attention_encoder(encoder_outputs)  # [B, src_len, H]
+        query = self.attention_hidden(query).unsqueeze(1)          # [B, 1, H]
+        
+        # Compute attention scores
+        scores = torch.bmm(encoder_features, query.transpose(1, 2))  # [B, src_len, 1]
+        
+        # Ensure we have attention weights for all positions
+        attn_weights = F.softmax(scores, dim=1)  # [B, src_len, 1]
+        
+        # Compute context vector
+        context = torch.bmm(attn_weights.transpose(1, 2), encoder_outputs)  # [B, 1, H]
+        
+        return context, attn_weights.squeeze(2)  # Return [B, src_len]
+    
+    def forward(self, trg, encoder_outputs, hidden):
+        batch_size = trg.size(0)
+        target_len = trg.size(1)
+        src_len = encoder_outputs.size(1)
+        
+        # Embed input tokens
+        embedded = self.embedding(trg)  # [B, T, E]
+        embedded = self.embedding_dropout(embedded)
+        
+        outputs = []
+        attention_weights = []
+        
+        # Process each target token
+        for t in range(target_len):
+            input_t = embedded[:, t:t+1]  # [B, 1, E]
+            
+            if self.attention:
+                # Compute attention
+                context, attn = self.compute_attention(encoder_outputs, hidden)
+                attention_weights.append(attn)  # Store weights for each step
+                
+                # Combine context with input
+                rnn_input = self.attention_combine(
+                    torch.cat((input_t, context), dim=2))
+            else:
+                rnn_input = input_t
+            
+            # RNN forward pass
+            output, hidden = self.rnn(rnn_input, hidden)
+            output = self.dropout(output)
+            pred = self.output(output)
+            outputs.append(pred)
+        
+        # Stack outputs
+        outputs = torch.cat(outputs, dim=1)  # [B, T, V]
+        if self.attention:
+            attention_matrix = torch.stack(attention_weights, dim=1)  # [B, T, S]
+            return outputs, attention_matrix
+        return outputs, None
 
 class Seq2SeqModel(nn.Module):
     def __init__(self, config):
@@ -128,33 +167,52 @@ class Seq2SeqModel(nn.Module):
         self.max_length = getattr(config, 'max_length', 30)  # Default to 30
 
     def _adjust_hidden_state(self, hidden, batch_size=None):
+        """Properly adjust hidden state dimensions between encoder and decoder"""
         if isinstance(hidden, tuple):  # LSTM
             h, c = hidden
             batch_size = h.size(1) if batch_size is None else batch_size
-            if self.num_encoder_layers < self.num_decoder_layers:
-                h_extra = torch.zeros(
-                    self.num_decoder_layers - self.num_encoder_layers,
-                    batch_size, self.hidden_dim, device=h.device
-                ).contiguous()
-                c_extra = torch.zeros(
-                    self.num_decoder_layers - self.num_encoder_layers,
-                    batch_size, self.hidden_dim, device=c.device
-                ).contiguous()
-                h = torch.cat([h, h_extra], dim=0)
-                c = torch.cat([c, c_extra], dim=0)
-            else:
-                h = h[-self.num_decoder_layers:]
-                c = c[-self.num_decoder_layers:]
+            
+            # Always use num_decoder_layers for target hidden size
+            target_layers = self.num_decoder_layers
+            current_layers = h.size(0)
+            
+            if current_layers != target_layers:
+                if current_layers < target_layers:
+                    # Add extra layers if needed
+                    h_extra = torch.zeros(
+                        target_layers - current_layers,
+                        batch_size, self.hidden_dim, device=h.device
+                    ).contiguous()
+                    c_extra = torch.zeros(
+                        target_layers - current_layers,
+                        batch_size, self.hidden_dim, device=c.device
+                    ).contiguous()
+                    h = torch.cat([h, h_extra], dim=0)
+                    c = torch.cat([c, c_extra], dim=0)
+                else:
+                    # Take required layers
+                    h = h[:target_layers]
+                    c = c[:target_layers]
+                    
             return (h.contiguous(), c.contiguous())
         else:  # GRU/RNN
-            batch_size = hidden.size(1) if batch_size is None else batch_size
-            if self.num_encoder_layers < self.num_decoder_layers:
-                extra = torch.zeros(
-                    self.num_decoder_layers - self.num_encoder_layers,
-                    batch_size, self.hidden_dim, device=hidden.device
-                ).contiguous()
-                return torch.cat([hidden, extra], dim=0).contiguous()
-            return hidden[-self.num_decoder_layers:].contiguous()
+            # Similar logic for single hidden state
+            hidden = hidden.contiguous()
+            target_layers = self.num_decoder_layers
+            current_layers = hidden.size(0)
+            
+            if current_layers != target_layers:
+                if current_layers < target_layers:
+                    extra = torch.zeros(
+                        target_layers - current_layers,
+                        batch_size if batch_size is not None else hidden.size(1),
+                        self.hidden_dim, device=hidden.device
+                    ).contiguous()
+                    hidden = torch.cat([hidden, extra], dim=0)
+                else:
+                    hidden = hidden[:target_layers]
+                    
+            return hidden.contiguous()
 
     def forward(self, src, tgt=None):
         batch_size = src.size(0)

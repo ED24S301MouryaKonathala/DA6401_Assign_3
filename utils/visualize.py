@@ -24,19 +24,31 @@ def create_sample_grid(samples, save_path, ncols=3, nrows=3):
     return wandb.Image(save_path)
 
 def plot_attention_heatmap(attention_weights, src_text, tgt_text, pred_text, save_path):
-    """Plot single attention heatmap"""
+    """Plot single attention heatmap with full coverage"""
     plt.figure(figsize=(10, 8))
+    
+    # Ensure proper normalization
+    attn = attention_weights.copy()
+    attn = attn / (attn.sum(axis=1, keepdims=True) + 1e-12)
+    
     sns.heatmap(
-        attention_weights.cpu().numpy(),
+        attn,
         xticklabels=list(src_text),
         yticklabels=list(pred_text),
-        cmap='viridis'
+        cmap='YlOrRd',
+        cbar=True,
+        square=True,
+        vmin=0.0,
+        vmax=1.0,
+        annot=True,
+        fmt='.2f'
     )
-    plt.title(f'Source: {src_text}\nTarget: {tgt_text}\nPred: {pred_text}')
+    
+    plt.xlabel('English Input')
+    plt.ylabel('Telugu Output')
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    return wandb.Image(save_path)
 
 def plot_attention_grid(attention_heatmaps, save_path):
     """Create 3x3 grid of individual attention heatmaps"""
